@@ -1,0 +1,19 @@
+name = "frame2frame"
+main = "main.ts"
+compatibility_date = "2025-05-12"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[[d1_databases]]
+binding = "DB"
+database_name = "frame2frame"
+# Replace with your actual D1 database ID after running:
+#   wrangler d1 create frame2frame
+database_id = "2deb03d2-1ca2-4664-b719-e8794819161b"
+
+# Set the signing secret with:
+#   wrangler secret put FRAMEIO_SIGNING_SECRET
+# For local dev, add it to .dev.vars:
+#   FRAMEIO_SIGNING_SECRET=your_secret_here
