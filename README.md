@@ -4,6 +4,8 @@ A Cloudflare Workers app that listens to a single Frame.io V4 account via webhoo
 
 Built on Cloudflare Workers + D1 + Hono. Deployed at `frame2frame.cpilsworth.workers.dev`.
 
+The architecture, scope, and design rationale for this codebase are documented in [docs/frame-io-asset-watch-poc.md](docs/frame-io-asset-watch-poc.md). It is a focused single-instance subset of the broader two-instance design at [docs/frame-io-sync-cloudflare.md](docs/frame-io-sync-cloudflare.md), which remains shelved.
+
 ## What it does
 
 ```mermaid
