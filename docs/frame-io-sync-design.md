@@ -292,7 +292,7 @@ sequenceDiagram
     participant CF as Customer Frame.io
 
     U->>AF: Upload new version of existing file
-    Note over U,AF: No automatic sync; new version is agency-internal
+    Note over U,AF: No automatic sync — new version is agency-internal
     U->>AF: Re-invoke "Publish to client review" on the file
     AF->>R: custom action invocation
     R-->>AF: Form callback
