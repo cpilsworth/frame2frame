@@ -49,6 +49,8 @@ If the existing asset is already inside a version stack (its `parent_id` is a st
 ### 2. Frame.io webhook
 Create a webhook in the Frame.io workspace settings pointing at `https://<your-worker>.workers.dev/webhook`. Subscribe to at least `file.created`, `file.updated`, `file.ready`, `comment.created`, `comment.updated`.
 
+See the [Frame.io V4 webhook setup guide](https://next.developer.frame.io/platform/docs/guides/webhooks) for the UI walkthrough, the full event-subscription reference, and signature-header details.
+
 Frame.io shows the signing secret **once on creation**. Store it:
 ```
 wrangler secret put FRAMEIO_SIGNING_SECRET
@@ -59,6 +61,14 @@ A bearer token from Frame.io (the developer portal or an IMS access token works)
 ```
 wrangler secret put FRAMEIO_TOKEN
 ```
+
+For convenience, [scripts/update-token.sh](scripts/update-token.sh) wraps the above with input validation and decodes the JWT to show `user_id` + expiry before uploading:
+```bash
+pbpaste | npm run token        # paste from clipboard (macOS)
+npm run token < token.txt      # from file
+npm run token                  # interactive — paste, then Ctrl-D
+```
+
 Note: short-lived IMS access tokens expire in ~1 hour and need to be re-set; for production, swap in an OAuth Server-to-Server credential flow (the old `src/frameio/ims.ts` module did this and can be restored).
 
 ### 4. Deploy
