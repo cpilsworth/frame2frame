@@ -62,6 +62,8 @@ A bearer token from Frame.io (the developer portal or an IMS access token works)
 wrangler secret put FRAMEIO_TOKEN
 ```
 
+If you can't get a working token through the Adobe Developer Console (auth scope mismatches, missing API entitlement, etc.), a quick fallback is to grab a short-lived user access token from the API Explorer — open any endpoint in the [Frame.io V4 API reference explorer](https://next.developer.frame.io/platform/v4/api-reference/accounts/index?explorer=true), sign in, and copy the bearer token it uses. It's tied to your user and expires in ~1 hour, but is sufficient for local testing and for the read-mostly flows this app does.
+
 For convenience, [scripts/update-token.sh](scripts/update-token.sh) wraps the above with input validation and decodes the JWT to show `user_id` + expiry before uploading:
 ```bash
 pbpaste | npm run token        # paste from clipboard (macOS)
