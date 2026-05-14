@@ -1,42 +1,102 @@
-# Frame.io V4 Webhook Handler
+# Frame.io Asset Watch
 
-A Val Town endpoint that receives, verifies, and logs [Frame.io V4 webhooks](https://next.developer.frame.io/platform/docs/guides/webhooks).
+A Cloudflare Workers app that listens to a single Frame.io V4 account via webhooks, lets you "watch" specific assets, captures all comments on watched assets to a local D1 database, and lets you upload new versions of a watched asset from your browser.
+
+Built on Cloudflare Workers + D1 + Hono. Deployed at `frame2frame.cpilsworth.workers.dev`.
 
 ## What it does
 
 ```mermaid
 flowchart LR
-  F[Frame.io] -->|POST /webhook + HMAC headers| V[main.ts]
-  V --> S[verify.ts<br/>HMAC SHA256]
-  S -->|valid| D[(SQLite<br/>frameio_events)]
-  S -->|invalid| X[401]
-  D --> H[home.tsx<br/>browser UI]
+  F[Frame.io] -->|POST /webhook| W[Worker]
+  W -->|verify HMAC| W
+  W -->|file.* / comment.*| API[Frame.io V4 API]
+  API -->|file + comment records| W
+  W -->|persist| D[(D1<br/>frameio_events<br/>assets<br/>watched_assets<br/>captured_comments)]
+  D --> UI[GET / — browser UI]
+  UI -->|Watch / Unwatch| W
+  UI -->|Upload new version| W
+  W -->|local_upload + version_stacks| API
 ```
 
-- `POST /webhook` — receives Frame.io webhook deliveries
-- `GET /` — shows the webhook URL and the 20 most recent events
-- `GET /source` — link to the source code on Val Town
+### Routes
+- `GET  /` — UI listing assets seen via webhook, with a Watch/Unwatch toggle and per-watched-asset panels showing comments + an upload form.
+- `POST /webhook` — Frame.io webhook receiver. Verifies HMAC, persists the raw event, and calls back to Frame.io's API to resolve metadata for `file.*` events and to fetch comment details for `comment.*` events.
+- `POST /watch/:fileId` — toggle the watched state for an asset. On first watch, backfills the asset's existing comments from Frame.io.
+- `POST /assets/:fileId/versions` — multipart upload that stacks a new version onto the watched asset.
+
+### Why the API callbacks
+Frame.io V4 webhooks are intentionally thin — they carry only IDs (`account`, `resource`, `user`, `project`, `workspace`). To show a useful UI we have to call back:
+- `GET /v4/accounts/{a}/files/{f}` after `file.*` events → caches name, media type, size, status, and the canonical `view_url` link in the `assets` table.
+- `GET /v4/accounts/{a}/comments/{c}?include=owner` after `comment.*` events → resolves the comment's parent file, body text, timecode, and author. Only inserts into `captured_comments` if the parent file is watched.
+- `GET /v4/accounts/{a}/files/{f}/comments?include=owner` on watch → backfills every existing comment so the panel isn't empty.
+
+### New-version upload flow
+Cloudflare Worker proxies bytes for now (capped ~100 MB by Workers' request body limit).
+1. `GET file` → find the existing asset's `parent_id` (the folder it lives in).
+2. `POST /accounts/{a}/folders/{folder_id}/files/local_upload` → response carries chunked S3 presigned PUT URLs.
+3. PUT each chunk to its signed URL with `x-amz-acl: private`.
+4. `POST /accounts/{a}/folders/{folder_id}/version_stacks` with `file_ids: [existing, new]` → stacks them as versions in the same folder.
+
+If the existing asset is already inside a version stack (its `parent_id` is a stack rather than a folder), local_upload returns 404 and the UI surfaces a clear error — adding to an existing stack isn't yet wired up.
 
 ## Setup
 
-1. **Register a webhook with Frame.io** using the URL shown on the home page (the `/webhook` path of this val). Choose the events you care about — see the [event reference](https://next.developer.frame.io/platform/docs/guides/webhooks#webhook-event-subscriptions).
-2. **Save the signing secret** that Frame.io returns *only on creation*. Set it as the `FRAMEIO_SIGNING_SECRET` env var on this val.
-3. Trigger a matching action in Frame.io. The event will appear on the home page.
+### 1. Cloudflare resources
+- `wrangler d1 create frame2frame` — note the database id and put it in [wrangler.toml](wrangler.toml).
+- `npm run db:migrate:remote` — applies all migrations to the remote D1.
+
+### 2. Frame.io webhook
+Create a webhook in the Frame.io workspace settings pointing at `https://<your-worker>.workers.dev/webhook`. Subscribe to at least `file.created`, `file.updated`, `file.ready`, `comment.created`, `comment.updated`.
+
+Frame.io shows the signing secret **once on creation**. Store it:
+```
+wrangler secret put FRAMEIO_SIGNING_SECRET
+```
+
+### 3. Frame.io API token
+A bearer token from Frame.io (the developer portal or an IMS access token works). Stored as:
+```
+wrangler secret put FRAMEIO_TOKEN
+```
+Note: short-lived IMS access tokens expire in ~1 hour and need to be re-set; for production, swap in an OAuth Server-to-Server credential flow (the old `src/frameio/ims.ts` module did this and can be restored).
+
+### 4. Deploy
+```
+npm run deploy
+```
 
 ## Signature verification
 
-Frame.io signs every delivery with HMAC SHA256 of `v0:<timestamp>:<body>`, sent as the `X-Frameio-Signature` header (`v0=<hex>`) alongside `X-Frameio-Request-Timestamp`. `verify.ts` does a constant-time comparison and rejects timestamps older than 5 minutes to defend against replay attacks.
+Frame.io signs every delivery with HMAC SHA256 of `v0:<timestamp>:<body>`, sent as `X-Frameio-Signature` (`v0=<hex>`) alongside `X-Frameio-Request-Timestamp`. [verify.ts](verify.ts) does a constant-time comparison and rejects timestamps older than 5 minutes to defend against replay attacks.
 
-## Adding business logic
+## Layout
 
-In `main.ts`, extend the `switch (payload.type)` block to react to events — for example, sync `file.ready` events to a DAM, forward `comment.created` to a ticket system, or post to Slack.
+```
+main.ts                Hono app: routes, webhook handler, helper field extractors
+verify.ts              HMAC SHA256 verification (reused as-is)
+db.ts                  Debug log accessors (frameio_events table)
+home.tsx               Server-rendered UI
+src/env.ts             Env interface (DB, FRAMEIO_SIGNING_SECRET, FRAMEIO_TOKEN)
+src/db/queries.ts      Typed accessors for assets / watched_assets / captured_comments
+src/frameio/client.ts  V4 API client: getFile, getComment, listFileComments,
+                       createLocalUpload, createVersionStack, putUploadChunk
+src/upload.ts          Multipart upload handler (browser → worker → Frame.io)
+migrations/            D1 schema migrations
+scripts/sign-test.ts   Helper to compute a valid signature for local testing
+docs/                  Background design docs (two-instance sync — shelved)
+```
 
-Note: Frame.io webhook payloads only include the resource ID. For richer data, [call the Frame.io API](https://next.developer.frame.io/platform/docs/) to look up the resource.
+## D1 schema
 
-## Files
+| Table | Purpose |
+|---|---|
+| `frameio_events` | Raw webhook log — every verified event |
+| `assets` | Cached file metadata resolved via API after `file.*` events |
+| `watched_assets` | User-selected files; webhook handler captures comments for these |
+| `captured_comments` | Resolved comment records (text, author, timecode) on watched files |
 
-- `main.ts` — Hono HTTP entrypoint
-- `verify.ts` — HMAC SHA256 signature verification
-- `db.ts` — SQLite persistence of received events
-- `home.tsx` — React server-rendered home page
-- `scripts/sign-test.ts` — helper to compute a valid signature for local testing
+## Notes
+
+- The `docs/frame-io-sync-cloudflare.md` file describes a two-instance bidirectional sync design that's currently out of scope. Single-instance behaviour is what this app actually implements.
+- Field extraction across `data.X` / `data.attributes.X` / `data.relationships.X.data.id` paths is defensive — Frame.io V4 wraps responses in `data` and the exact field names are tracked in the docs but flagged with `TODO(v4-verify)` comments where unverified.
