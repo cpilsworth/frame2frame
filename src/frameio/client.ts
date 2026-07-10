@@ -6,6 +6,22 @@ import type { Env } from "../env";
 
 const API_BASE = "https://api.frame.io/v4";
 
+// Frame.io V4 ids are UUID-like. Anything else (slashes, dots, percent
+// escapes) could redirect a request to a different API endpoint when
+// interpolated into a URL path, so ids are validated before use.
+const SAFE_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+export function isValidFrameIoId(id: string): boolean {
+  return SAFE_ID.test(id);
+}
+
+function safeId(kind: string, id: string): string {
+  if (!isValidFrameIoId(id)) {
+    throw new FrameIoApiError(400, `invalid ${kind} id`);
+  }
+  return id;
+}
+
 export interface FrameIoFile {
   id: string;
   name: string;
@@ -38,7 +54,10 @@ export class FrameIoClient {
   constructor(private env: Env) {}
 
   async getFile(accountId: string, fileId: string): Promise<FrameIoFile> {
-    return this.request<FrameIoFile>("GET", `/accounts/${accountId}/files/${fileId}`);
+    return this.request<FrameIoFile>(
+      "GET",
+      `/accounts/${safeId("account", accountId)}/files/${safeId("file", fileId)}`,
+    );
   }
 
   // The webhook for comment.created carries no file reference — we fetch the
@@ -47,7 +66,7 @@ export class FrameIoClient {
   async getComment(accountId: string, commentId: string): Promise<Record<string, unknown>> {
     return this.request<Record<string, unknown>>(
       "GET",
-      `/accounts/${accountId}/comments/${commentId}?include=owner`,
+      `/accounts/${safeId("account", accountId)}/comments/${safeId("comment", commentId)}?include=owner`,
     );
   }
 
@@ -56,7 +75,7 @@ export class FrameIoClient {
   // default is 50. `?include=owner` for author details.
   async listFileComments(accountId: string, fileId: string): Promise<Record<string, unknown>[]> {
     const collected: Record<string, unknown>[] = [];
-    let path: string | null = `/accounts/${accountId}/files/${fileId}/comments?page_size=50&include=owner`;
+    let path: string | null = `/accounts/${safeId("account", accountId)}/files/${safeId("file", fileId)}/comments?page_size=50&include=owner`;
     while (path) {
       const resp: { data?: Record<string, unknown>[]; links?: { next?: string } } =
         await this.request("GET", path);
@@ -83,7 +102,7 @@ export class FrameIoClient {
   ): Promise<LocalUploadResponse> {
     const wrapped = await this.request<{ data: LocalUploadResponse }>(
       "POST",
-      `/accounts/${accountId}/folders/${folderId}/files/local_upload`,
+      `/accounts/${safeId("account", accountId)}/folders/${safeId("folder", folderId)}/files/local_upload`,
       { data: { name: args.name, file_size: args.file_size } },
     );
     return wrapped.data;
@@ -98,7 +117,7 @@ export class FrameIoClient {
   ): Promise<VersionStack> {
     const wrapped = await this.request<{ data: VersionStack }>(
       "POST",
-      `/accounts/${accountId}/folders/${folderId}/version_stacks`,
+      `/accounts/${safeId("account", accountId)}/folders/${safeId("folder", folderId)}/version_stacks`,
       { data: { file_ids: args.file_ids } },
     );
     return wrapped.data;

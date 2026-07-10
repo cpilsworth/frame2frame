@@ -83,7 +83,23 @@ export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId:
 
     // 3. Slice the in-memory bytes per the chunk sizes Frame.io returned and
     //    PUT each one. The number/size of chunks varies with file_size.
+    //    Refuse to upload if the chunk sizes don't cover the file exactly —
+    //    stacking a truncated version is worse than failing. The placeholder
+    //    file created by local_upload is left unfilled in Frame.io.
     const bytes = await fileEntry.arrayBuffer();
+    const totalChunkSize = created.upload_urls.reduce((sum, chunk) => sum + chunk.size, 0);
+    if (totalChunkSize !== bytes.byteLength) {
+      console.error(
+        `upload aborted: chunk sizes total ${totalChunkSize} != file size ${bytes.byteLength} (placeholder file ${created.id})`,
+      );
+      return c.json(
+        {
+          error: "upload aborted",
+          detail: `Frame.io returned upload chunks totalling ${totalChunkSize} bytes for a ${bytes.byteLength}-byte file; refusing to upload a truncated version.`,
+        },
+        502,
+      );
+    }
     let offset = 0;
     for (let i = 0; i < created.upload_urls.length; i++) {
       const chunk = created.upload_urls[i];
@@ -91,11 +107,6 @@ export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId:
       const slice = bytes.slice(offset, end);
       await client.putUploadChunk(chunk.url, slice, contentType);
       offset = end;
-    }
-    if (offset !== bytes.byteLength) {
-      console.warn(
-        `upload chunk total (${offset}) != file size (${bytes.byteLength}); upload may be incomplete`,
-      );
     }
 
     // 4. Stack the new file on top of the existing one as a version.

@@ -21,13 +21,14 @@ function prettify(raw: string) {
 
 // Prefer the authoritative `view_url` from the Frame.io file record (cached
 // in the `assets` table). Fall back to a constructed URL when the file
-// metadata hasn't been resolved yet.
+// metadata hasn't been resolved yet. Only https URLs are rendered as links —
+// the value comes from an API response, not our own code.
 function frameIoAssetUrl(w: {
   file_id: string;
   project_id: string | null;
   view_url: string | null;
 }): string {
-  if (w.view_url) return w.view_url;
+  if (w.view_url && w.view_url.startsWith("https://")) return w.view_url;
   if (w.project_id) {
     return `https://next.frame.io/project/${encodeURIComponent(w.project_id)}/view/${encodeURIComponent(w.file_id)}`;
   }

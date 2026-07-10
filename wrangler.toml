@@ -19,4 +19,6 @@ database_id = "2deb03d2-1ca2-4664-b719-e8794819161b"
 # Secrets — set via `wrangler secret put`:
 #   FRAMEIO_SIGNING_SECRET   — Frame.io webhook signing secret
 #   FRAMEIO_TOKEN            — Frame.io developer / personal access token (bearer)
+#   UI_PASSWORD              — basic-auth password for the browser UI (required; UI is 503 until set)
+#   UI_USERNAME              — basic-auth username (optional, defaults to "admin")
 # For local dev, mirror them into .dev.vars (gitignored).

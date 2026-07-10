@@ -9,6 +9,7 @@
 // Docs: https://next.developer.frame.io/platform/docs/guides/webhooks
 
 import { Hono } from "hono";
+import { basicAuth } from "hono/basic-auth";
 import { verifySignature } from "./verify";
 import { recordEvent, recentEvents } from "./db";
 import { renderHome } from "./home";
@@ -24,11 +25,26 @@ import {
   upsertAsset,
 } from "./src/db/queries";
 import { handleVersionUpload } from "./src/upload";
-import { FrameIoClient } from "./src/frameio/client";
+import { FrameIoClient, isValidFrameIoId } from "./src/frameio/client";
 
 export type { Env };
 
 const app = new Hono<{ Bindings: Env }>();
+
+// Everything except /webhook (which authenticates via HMAC signature) is
+// gated behind basic auth: the UI exposes comment text and author emails,
+// and the upload/watch routes act on Frame.io with the server's token.
+// Fails closed with 503 until the UI_PASSWORD secret is set.
+app.use("*", async (c, next) => {
+  if (c.req.path === "/webhook") return next();
+  if (!c.env.UI_PASSWORD) {
+    return c.text("UI disabled: set the UI_PASSWORD secret (wrangler secret put UI_PASSWORD)", 503);
+  }
+  return basicAuth({
+    username: c.env.UI_USERNAME || "admin",
+    password: c.env.UI_PASSWORD,
+  })(c, next);
+});
 
 app.get("/", async (c) => {
   const [assets, watched, events] = await Promise.all([
@@ -137,6 +153,9 @@ app.post("/webhook", async (c) => {
 
 app.post("/watch/:fileId", async (c) => {
   const fileId = c.req.param("fileId");
+  if (!isValidFrameIoId(fileId)) {
+    return c.json({ error: "invalid file id" }, 400);
+  }
   const form = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>);
   const action = typeof form.action === "string" ? form.action : "toggle";
 
@@ -145,13 +164,13 @@ app.post("/watch/:fileId", async (c) => {
   if (action === "unwatch" || (action === "toggle" && currentlyWatched)) {
     await unwatchAsset(c.env.DB, fileId);
   } else {
-    const accountId = stringOrNull(form.account_id);
+    const accountId = idOrNull(form.account_id);
     await watchAsset(c.env.DB, {
       file_id: fileId,
       name: stringOrNull(form.name),
       account_id: accountId,
-      workspace_id: stringOrNull(form.workspace_id),
-      project_id: stringOrNull(form.project_id),
+      workspace_id: idOrNull(form.workspace_id),
+      project_id: idOrNull(form.project_id),
     });
     // Backfill existing comments + ensure asset metadata is cached.
     if (accountId) {
@@ -169,7 +188,13 @@ app.post("/watch/:fileId", async (c) => {
   return c.redirect("/", 303);
 });
 
-app.post("/assets/:fileId/versions", (c) => handleVersionUpload(c, c.req.param("fileId")));
+app.post("/assets/:fileId/versions", (c) => {
+  const fileId = c.req.param("fileId");
+  if (!isValidFrameIoId(fileId)) {
+    return c.json({ error: "invalid file id" }, 400);
+  }
+  return handleVersionUpload(c, fileId);
+});
 
 export default { fetch: app.fetch };
 
@@ -196,6 +221,12 @@ interface WebhookPayload {
 
 function stringOrNull(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+// Form-posted ids end up in D1 and in Frame.io API URL paths — drop anything
+// that isn't shaped like a Frame.io id rather than storing it.
+function idOrNull(v: unknown): string | null {
+  return typeof v === "string" && isValidFrameIoId(v) ? v : null;
 }
 
 function isFileEvent(type: string): boolean {

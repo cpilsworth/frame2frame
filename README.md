@@ -24,6 +24,8 @@ flowchart LR
 ```
 
 ### Routes
+All routes except `POST /webhook` require HTTP basic auth (see setup step 4); the webhook authenticates via its HMAC signature instead.
+
 - `GET  /` — UI listing assets seen via webhook, with a Watch/Unwatch toggle and per-watched-asset panels showing comments + an upload form.
 - `POST /webhook` — Frame.io webhook receiver. Verifies HMAC, persists the raw event, and calls back to Frame.io's API to resolve metadata for `file.*` events and to fetch comment details for `comment.*` events.
 - `POST /watch/:fileId` — toggle the watched state for an asset. On first watch, backfills the asset's existing comments from Frame.io.
@@ -77,7 +79,14 @@ npm run token                  # interactive — paste, then Ctrl-D
 
 Note: short-lived IMS access tokens expire in ~1 hour and need to be re-set; for production, swap in an OAuth Server-to-Server credential flow (the old `src/frameio/ims.ts` module did this and can be restored).
 
-### 4. Deploy
+### 4. UI credentials
+The browser UI (every route except `/webhook`) is protected by HTTP basic auth and fails closed (503) until a password is set:
+```
+wrangler secret put UI_PASSWORD    # required
+wrangler secret put UI_USERNAME    # optional — defaults to "admin"
+```
+
+### 5. Deploy
 ```
 npm run deploy
 ```
