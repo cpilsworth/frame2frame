@@ -19,7 +19,12 @@
 import type { Context } from "hono";
 import type { Env } from "./env";
 import { getWatchedAsset } from "./db/queries";
-import { FrameIoClient, FrameIoApiError, hasFrameIoCredentials } from "./frameio/client";
+import {
+  FrameIoClient,
+  FrameIoApiError,
+  hasFrameIoCredentials,
+  isValidFrameIoId,
+} from "./frameio/client";
 
 export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId: string) {
   const watched = await getWatchedAsset(c.env.DB, fileId);
@@ -134,6 +139,115 @@ export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId:
     console.error("Upload failed:", err);
     const status = err instanceof FrameIoApiError ? err.status : 500;
     return c.json({ error: "upload failed", detail: errorDetail(err) }, status === 401 ? 502 : 500);
+  }
+}
+
+// Direct-upload, step 1: create the placeholder file and hand its presigned
+// chunk URLs back to the browser, which PUTs to them itself (no ~100 MB body
+// cap). Mirrors handleVersionUpload's checks and its 404 → version-stack
+// explanation, but stops before the bytes are transferred.
+export async function handlePrepareVersion(c: Context<{ Bindings: Env }>, fileId: string) {
+  const watched = await getWatchedAsset(c.env.DB, fileId);
+  if (!watched) {
+    return c.json({ error: "asset is not watched" }, 404);
+  }
+  if (!watched.account_id) {
+    return c.json({ error: "watched asset is missing account_id; re-watch it first" }, 409);
+  }
+  if (!hasFrameIoCredentials(c.env)) {
+    return c.json({ error: "no Frame.io credentials configured" }, 500);
+  }
+
+  let body: { name?: unknown; size?: unknown; type?: unknown };
+  try {
+    body = await c.req.json();
+  } catch (err) {
+    return c.json({ error: "invalid JSON body", detail: errorDetail(err) }, 400);
+  }
+  const name = typeof body.name === "string" && body.name.length > 0 ? body.name : "upload.bin";
+  const size = typeof body.size === "number" ? body.size : NaN;
+  if (!Number.isInteger(size) || size <= 0) {
+    return c.json({ error: "invalid or missing file size" }, 400);
+  }
+
+  const client = new FrameIoClient(c.env);
+  try {
+    const fileRecord = (await client.getFile(watched.account_id, fileId)) as unknown as {
+      data?: { parent_id?: string };
+    };
+    const parentId = fileRecord.data?.parent_id ?? null;
+    if (!parentId) {
+      return c.json({ error: "could not resolve parent folder of existing file" }, 502);
+    }
+    let created;
+    try {
+      created = await client.createLocalUpload(watched.account_id, parentId, {
+        name,
+        file_size: size,
+      });
+    } catch (err) {
+      if (err instanceof FrameIoApiError && err.status === 404) {
+        return c.json(
+          {
+            error: "upload failed",
+            detail:
+              "local_upload returned 404 — the asset's parent may be a version stack rather than a folder. Uploading additional versions onto an existing stack isn't supported yet.",
+          },
+          502,
+        );
+      }
+      throw err;
+    }
+    return c.json({ new_file_id: created.id, upload_urls: created.upload_urls });
+  } catch (err) {
+    console.error("Prepare upload failed:", err);
+    const status = err instanceof FrameIoApiError ? err.status : 500;
+    return c.json({ error: "prepare failed", detail: errorDetail(err) }, status === 401 ? 502 : 500);
+  }
+}
+
+// Direct-upload, step 2: once the browser has PUT every chunk, stack the new
+// file on top of the existing one as a version.
+export async function handleFinalizeVersion(c: Context<{ Bindings: Env }>, fileId: string) {
+  const watched = await getWatchedAsset(c.env.DB, fileId);
+  if (!watched) {
+    return c.json({ error: "asset is not watched" }, 404);
+  }
+  if (!watched.account_id) {
+    return c.json({ error: "watched asset is missing account_id; re-watch it first" }, 409);
+  }
+  if (!hasFrameIoCredentials(c.env)) {
+    return c.json({ error: "no Frame.io credentials configured" }, 500);
+  }
+
+  let body: { new_file_id?: unknown };
+  try {
+    body = await c.req.json();
+  } catch (err) {
+    return c.json({ error: "invalid JSON body", detail: errorDetail(err) }, 400);
+  }
+  const newFileId = typeof body.new_file_id === "string" ? body.new_file_id : "";
+  if (!isValidFrameIoId(newFileId)) {
+    return c.json({ error: "invalid or missing new_file_id" }, 400);
+  }
+
+  const client = new FrameIoClient(c.env);
+  try {
+    const fileRecord = (await client.getFile(watched.account_id, fileId)) as unknown as {
+      data?: { parent_id?: string };
+    };
+    const parentId = fileRecord.data?.parent_id ?? null;
+    if (!parentId) {
+      return c.json({ error: "could not resolve parent folder of existing file" }, 502);
+    }
+    const stack = await client.createVersionStack(watched.account_id, parentId, {
+      file_ids: [fileId, newFileId],
+    });
+    return c.json({ version_stack_id: stack.id });
+  } catch (err) {
+    console.error("Finalize upload failed:", err);
+    const status = err instanceof FrameIoApiError ? err.status : 500;
+    return c.json({ error: "finalize failed", detail: errorDetail(err) }, status === 401 ? 502 : 500);
   }
 }
 

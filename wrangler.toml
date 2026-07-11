@@ -6,6 +6,12 @@ compatibility_date = "2025-05-12"
 enabled = true
 head_sampling_rate = 1
 
+# Static assets (the esbuild-produced client bundle). Served directly at their
+# path (e.g. /app.js) without invoking the Worker; the Worker handles every
+# other route. `npm run build` populates public/ before `wrangler deploy`.
+[assets]
+directory = "public"
+
 [observability.traces]
 enabled = false
 
