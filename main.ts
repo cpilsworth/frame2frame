@@ -5,6 +5,8 @@
 //   POST /webhook                   — Frame.io webhook (verify + log + capture comments on watched files)
 //   POST /watch/:fileId             — toggle watched state (form post)
 //   POST /assets/:fileId/versions   — upload a new version (multipart/form-data)
+//   POST /assets/:fileId/versions/prepare  — direct-upload step 1 (JSON)
+//   POST /assets/:fileId/versions/finalize — direct-upload step 2 (JSON)
 //
 // Docs: https://next.developer.frame.io/platform/docs/guides/webhooks
 
@@ -24,7 +26,7 @@ import {
   commentsForFile,
   upsertAsset,
 } from "./src/db/queries";
-import { handleVersionUpload } from "./src/upload";
+import { handleVersionUpload, handlePrepareVersion, handleFinalizeVersion } from "./src/upload";
 import { FrameIoClient, isValidFrameIoId } from "./src/frameio/client";
 
 export type { Env };
@@ -60,7 +62,42 @@ app.get("/", async (c) => {
   );
   const webhookUrl = new URL("/webhook", c.req.url).toString();
   const uploadedFileId = c.req.query("uploaded") ?? null;
-  return c.html(renderHome({ assets, watched, commentsByFile, events, webhookUrl, uploadedFileId }));
+  const uploadStackFailed = c.req.query("stack_failed") === "1";
+
+  // twind's CDN script is gone, so the page's only script is our same-origin
+  // bundle. Lock the page down: scripts from self only; inline styles are
+  // allowed because Spectrum Web Components inject their styles and we ship one
+  // inline <style> block; connect-src allows the presigned S3 hosts (https)
+  // that the direct upload PUTs to, plus self for prepare/finalize.
+  c.header(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: https:",
+      "font-src 'self' data:",
+      "connect-src 'self' https:",
+      "base-uri 'self'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "object-src 'none'",
+    ].join("; "),
+  );
+  c.header("X-Frame-Options", "DENY");
+  c.header("Referrer-Policy", "no-referrer");
+
+  return c.html(
+    renderHome({
+      assets,
+      watched,
+      commentsByFile,
+      events,
+      webhookUrl,
+      uploadedFileId,
+      uploadStackFailed,
+    }),
+  );
 });
 
 app.post("/webhook", async (c) => {
@@ -194,6 +231,25 @@ app.post("/assets/:fileId/versions", (c) => {
     return c.json({ error: "invalid file id" }, 400);
   }
   return handleVersionUpload(c, fileId);
+});
+
+// Direct-to-presigned-URL upload: the browser calls prepare, PUTs the chunks
+// itself, then calls finalize. Falls back to POST /assets/:fileId/versions
+// above when the browser can't reach the presigned host (CORS).
+app.post("/assets/:fileId/versions/prepare", (c) => {
+  const fileId = c.req.param("fileId");
+  if (!isValidFrameIoId(fileId)) {
+    return c.json({ error: "invalid file id" }, 400);
+  }
+  return handlePrepareVersion(c, fileId);
+});
+
+app.post("/assets/:fileId/versions/finalize", (c) => {
+  const fileId = c.req.param("fileId");
+  if (!isValidFrameIoId(fileId)) {
+    return c.json({ error: "invalid file id" }, 400);
+  }
+  return handleFinalizeVersion(c, fileId);
 });
 
 export default { fetch: app.fetch };

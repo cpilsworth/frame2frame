@@ -10,5 +10,5 @@
     "strict": true,
     "noEmit": true
   },
-  "exclude": ["scripts", "test", "node_modules"]
+  "exclude": ["scripts", "test", "node_modules", "src/client", "vitest.config.ts"]
 }
