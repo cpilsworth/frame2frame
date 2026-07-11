@@ -7,7 +7,8 @@
     "deploy": "wrangler deploy",
     "db:migrate:local": "wrangler d1 migrations apply frame2frame --local",
     "db:migrate:remote": "wrangler d1 migrations apply frame2frame --remote",
-    "token": "bash scripts/update-token.sh"
+    "token": "bash scripts/update-token.sh",
+    "test": "vitest run"
   },
   "dependencies": {
     "hono": "^4.7.0",
@@ -19,6 +20,7 @@
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "typescript": "^5.7.0",
+    "vitest": "^4.1.10",
     "wrangler": "^4.0.0"
   }
 }
