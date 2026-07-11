@@ -3,6 +3,7 @@
 // doc and will need confirmation against the live V4 reference.
 
 import type { Env } from "../env";
+import { getImsAccessToken } from "./ims";
 
 const API_BASE = "https://api.frame.io/v4";
 
@@ -48,6 +49,13 @@ export interface VersionStack {
   id: string;
   name?: string;
   parent_id?: string;
+}
+
+// True when the worker has enough configuration to authenticate against the
+// Frame.io API — either an IMS OAuth Server-to-Server credential or a
+// static FRAMEIO_TOKEN.
+export function hasFrameIoCredentials(env: Env): boolean {
+  return Boolean((env.IMS_CLIENT_ID && env.IMS_CLIENT_SECRET) || env.FRAMEIO_TOKEN);
 }
 
 export class FrameIoClient {
@@ -143,12 +151,22 @@ export class FrameIoClient {
 
   // ---------------------------------------------------------------------------
 
+  // IMS OAuth Server-to-Server credentials take priority when present;
+  // otherwise fall back to the static FRAMEIO_TOKEN.
+  private async resolveBearer(): Promise<string> {
+    if (this.env.IMS_CLIENT_ID && this.env.IMS_CLIENT_SECRET) {
+      return getImsAccessToken(this.env);
+    }
+    return this.env.FRAMEIO_TOKEN;
+  }
+
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${API_BASE}${path}`;
+    const bearer = await this.resolveBearer();
     const resp = await fetch(url, {
       method,
       headers: {
-        Authorization: `Bearer ${this.env.FRAMEIO_TOKEN}`,
+        Authorization: `Bearer ${bearer}`,
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,

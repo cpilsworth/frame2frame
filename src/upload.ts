@@ -19,7 +19,7 @@
 import type { Context } from "hono";
 import type { Env } from "./env";
 import { getWatchedAsset } from "./db/queries";
-import { FrameIoClient, FrameIoApiError } from "./frameio/client";
+import { FrameIoClient, FrameIoApiError, hasFrameIoCredentials } from "./frameio/client";
 
 export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId: string) {
   const watched = await getWatchedAsset(c.env.DB, fileId);
@@ -29,7 +29,7 @@ export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId:
   if (!watched.account_id) {
     return c.json({ error: "watched asset is missing account_id; re-watch it first" }, 409);
   }
-  if (!c.env.FRAMEIO_TOKEN) {
+  if (!hasFrameIoCredentials(c.env)) {
     return c.json({ error: "FRAMEIO_TOKEN not set" }, 500);
   }
 
