@@ -9,5 +9,6 @@
     "jsxImportSource": "react",
     "strict": true,
     "noEmit": true
-  }
+  },
+  "exclude": ["scripts", "test", "node_modules"]
 }
