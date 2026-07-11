@@ -25,3 +25,6 @@ database_id = "2deb03d2-1ca2-4664-b719-e8794819161b"
 #   IMS_CLIENT_SECRET        — Adobe IMS OAuth Server-to-Server client secret
 #   IMS_SCOPES               — optional, comma-separated IMS scopes (defaults to openid,AdobeID,read_organizations,frameio_api,offline_access)
 # For local dev, mirror them into .dev.vars (gitignored).
+
+[triggers]
+crons = ["*/30 * * * *"]

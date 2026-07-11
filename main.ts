@@ -2,16 +2,21 @@
 //
 // Routes:
 //   GET  /                          — UI: assets seen, watch toggles, comments, upload
-//   POST /webhook                   — Frame.io webhook (verify + log + capture comments on watched files)
+//   POST /webhook                   — Frame.io webhook (verify + log synchronously; process async)
 //   POST /watch/:fileId             — toggle watched state (form post)
+//   POST /watch/:fileId/refresh     — re-resolve metadata + re-backfill comments for a watched asset
 //   POST /assets/:fileId/versions   — upload a new version (multipart/form-data)
+//
+// scheduled() runs a reconciliation pass every 30 minutes: re-resolves and
+// re-backfills every watched asset, drops captured comments that no longer
+// exist upstream, and prunes old rows from the raw event log.
 //
 // Docs: https://next.developer.frame.io/platform/docs/guides/webhooks
 
 import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
 import { verifySignature } from "./verify";
-import { recordEvent, recentEvents } from "./db";
+import { recordEvent, recentEvents, pruneOldEvents } from "./db";
 import { renderHome } from "./home";
 import type { Env } from "./src/env";
 import {
@@ -20,9 +25,14 @@ import {
   isWatched,
   watchAsset,
   unwatchAsset,
+  getWatchedAsset,
   insertCapturedComment,
+  deleteCapturedComment,
+  deleteCommentsNotIn,
   commentsForFile,
   upsertAsset,
+  markAssetDeleted,
+  setBackfillStatus,
 } from "./src/db/queries";
 import { handleVersionUpload } from "./src/upload";
 import { FrameIoClient, hasFrameIoCredentials, isValidFrameIoId } from "./src/frameio/client";
@@ -95,57 +105,20 @@ app.post("/webhook", async (c) => {
   }
 
   console.log("Frame.io webhook received:", payload.type);
-  await recordEvent(c.env.DB, payload as unknown as Record<string, unknown>, rawBody);
+  // Signature verification, JSON parsing, and the raw-event log write stay
+  // synchronous so we always have a durable record of the delivery. Everything
+  // that calls out to the Frame.io API happens after the response is sent —
+  // Frame.io only needs a fast 2xx, and retries on timeout/5xx anyway.
+  const { isNew } = await recordEvent(c.env.DB, payload as unknown as Record<string, unknown>, rawBody);
 
-  // file.* events carry no metadata in the body — fetch and cache.
-  if (isFileEvent(payload.type)) {
-    const accountId = payload.account?.id ?? null;
-    const fileId = payload.resource?.id ?? payload.file?.id ?? null;
-    if (accountId && fileId) {
-      await resolveAndCacheFile(c.env, accountId, fileId);
-    }
-  }
-
-  // Capture comments on watched files. The webhook body doesn't include the
-  // comment's parent file — we have to GET the comment from Frame.io to find
-  // out which file it belongs to.
-  if (payload.type === "comment.created" || payload.type === "comment.updated") {
-    const accountId = payload.account?.id ?? null;
-    const commentId = payload.resource?.id ?? null;
-    if (!accountId || !commentId) {
-      console.warn("comment webhook: missing account.id or resource.id; skipping");
-    } else if (!hasFrameIoCredentials(c.env)) {
-      console.warn("comment webhook: FRAMEIO_TOKEN not set; cannot resolve parent file");
-    } else {
-      try {
-        const client = new FrameIoClient(c.env);
-        const comment = await client.getComment(accountId, commentId);
-        const details = extractCommentDetails(comment, payload);
-        if (!details.fileId) {
-          console.warn(
-            "comment webhook: comment record had no parent file id",
-            JSON.stringify(comment).slice(0, 1000),
-          );
-        } else if (await isWatched(c.env.DB, details.fileId)) {
-          await insertCapturedComment(c.env.DB, {
-            comment_id: commentId,
-            file_id: details.fileId,
-            parent_id: details.parentId,
-            author_name: details.authorName,
-            author_email: details.authorEmail,
-            text: details.text,
-            timecode: details.timecode,
-            raw_payload: JSON.stringify({ webhook: payload, comment }),
-          });
-        } else {
-          console.log(
-            `comment webhook: file ${details.fileId} not in watched_assets; skipping`,
-          );
-        }
-      } catch (err) {
-        console.error("comment webhook: getComment failed:", err);
-      }
-    }
+  if (isNew) {
+    c.executionCtx.waitUntil(
+      processWebhookEvent(c.env, payload).catch((err) => {
+        console.error("processWebhookEvent failed:", err);
+      }),
+    );
+  } else {
+    console.log(`webhook: duplicate delivery id=${payload.id ?? "(none)"}; skipping`);
   }
 
   return c.json({ ok: true });
@@ -176,14 +149,43 @@ app.post("/watch/:fileId", async (c) => {
     if (accountId) {
       await Promise.all([
         resolveAndCacheFile(c.env, accountId, fileId),
-        backfillCommentsForFile(c.env, accountId, fileId).then((r) =>
-          console.log(`watch backfill ${fileId}: inserted=${r.inserted} skipped=${r.skipped}${r.error ? " error=" + r.error : ""}`),
-        ),
+        backfillCommentsForFile(c.env, accountId, fileId).then((r) => {
+          console.log(`watch backfill ${fileId}: inserted=${r.inserted} skipped=${r.skipped}${r.error ? " error=" + r.error : ""}`);
+          return setBackfillStatus(c.env.DB, fileId, r.error ?? null);
+        }),
       ]);
     } else {
       console.warn(`watch ${fileId}: no account_id in form; skipping backfill`);
     }
   }
+
+  return c.redirect("/", 303);
+});
+
+// Manually re-run metadata resolution + comment backfill for a watched
+// asset, e.g. after fixing FRAMEIO_TOKEN or to pull in comments made before
+// the file was watched. Always records the outcome (success or error) on
+// watched_assets so the UI can surface it.
+app.post("/watch/:fileId/refresh", async (c) => {
+  const fileId = c.req.param("fileId");
+  if (!isValidFrameIoId(fileId)) {
+    return c.json({ error: "invalid file id" }, 400);
+  }
+
+  const watched = await getWatchedAsset(c.env.DB, fileId);
+  if (!watched) {
+    return c.json({ error: "asset is not watched" }, 404);
+  }
+
+  if (!watched.account_id) {
+    await setBackfillStatus(c.env.DB, fileId, "no account_id on watched asset; re-watch it to set one");
+    return c.redirect("/", 303);
+  }
+
+  await resolveAndCacheFile(c.env, watched.account_id, fileId);
+  const result = await backfillCommentsForFile(c.env, watched.account_id, fileId);
+  console.log(`refresh backfill ${fileId}: inserted=${result.inserted} skipped=${result.skipped}${result.error ? " error=" + result.error : ""}`);
+  await setBackfillStatus(c.env.DB, fileId, result.error ?? null);
 
   return c.redirect("/", 303);
 });
@@ -196,7 +198,12 @@ app.post("/assets/:fileId/versions", (c) => {
   return handleVersionUpload(c, fileId);
 });
 
-export default { fetch: app.fetch };
+export default {
+  fetch: app.fetch,
+  scheduled: async (_controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
+    ctx.waitUntil(runReconciliation(env));
+  },
+};
 
 // ---------------------------------------------------------------------------
 
@@ -217,6 +224,127 @@ interface WebhookPayload {
     start_time?: string;
     timestamp?: number;
   };
+}
+
+// All Frame.io API work for a webhook delivery — run from `waitUntil` after
+// the response is already sent. Every branch below is self-contained and
+// catches its own errors so one failing branch (e.g. a 401 from a stale
+// FRAMEIO_TOKEN) can't stop the others; the caller also wraps this whole
+// function in a `.catch` as a last-resort safety net.
+async function processWebhookEvent(env: Env, payload: WebhookPayload): Promise<void> {
+  const type = payload.type;
+
+  // Deletions never GET the deleted resource — Frame.io returns 404 for
+  // that, and the webhook body already carries everything we need.
+  if (type === "file.deleted") {
+    const fileId = payload.resource?.id ?? payload.file?.id ?? null;
+    if (!fileId) {
+      console.warn("file.deleted: missing resource id; skipping");
+      return;
+    }
+    try {
+      await markAssetDeleted(env.DB, fileId);
+    } catch (err) {
+      console.error(`file.deleted: markAssetDeleted(${fileId}) failed:`, err);
+    }
+    return;
+  }
+
+  if (type === "comment.deleted") {
+    const commentId = payload.resource?.id ?? null;
+    if (!commentId) {
+      console.warn("comment.deleted: missing resource id; skipping");
+      return;
+    }
+    try {
+      await deleteCapturedComment(env.DB, commentId);
+    } catch (err) {
+      console.error(`comment.deleted: deleteCapturedComment(${commentId}) failed:`, err);
+    }
+    return;
+  }
+
+  // file.* events carry no metadata in the body — fetch and cache.
+  if (isFileEvent(type)) {
+    const accountId = payload.account?.id ?? null;
+    const fileId = payload.resource?.id ?? payload.file?.id ?? null;
+    if (accountId && fileId) {
+      await resolveAndCacheFile(env, accountId, fileId);
+    }
+  }
+
+  // Capture comments on watched files. The webhook body doesn't include the
+  // comment's parent file — we have to GET the comment from Frame.io to find
+  // out which file it belongs to.
+  if (type === "comment.created" || type === "comment.updated") {
+    const accountId = payload.account?.id ?? null;
+    const commentId = payload.resource?.id ?? null;
+    if (!accountId || !commentId) {
+      console.warn("comment webhook: missing account.id or resource.id; skipping");
+      return;
+    }
+    if (!hasFrameIoCredentials(env)) {
+      console.warn("comment webhook: no Frame.io credentials; cannot resolve parent file");
+      return;
+    }
+    try {
+      const client = new FrameIoClient(env);
+      const comment = await client.getComment(accountId, commentId);
+      const details = extractCommentDetails(comment, payload);
+      if (!details.fileId) {
+        console.warn(
+          "comment webhook: comment record had no parent file id",
+          JSON.stringify(comment).slice(0, 1000),
+        );
+      } else if (await isWatched(env.DB, details.fileId)) {
+        await insertCapturedComment(env.DB, {
+          comment_id: commentId,
+          file_id: details.fileId,
+          parent_id: details.parentId,
+          author_name: details.authorName,
+          author_email: details.authorEmail,
+          text: details.text,
+          timecode: details.timecode,
+          comment_created_at: details.commentCreatedAt,
+          comment_updated_at: details.commentUpdatedAt,
+          raw_payload: JSON.stringify({ webhook: payload, comment }),
+        });
+      } else {
+        console.log(`comment webhook: file ${details.fileId} not in watched_assets; skipping`);
+      }
+    } catch (err) {
+      console.error("comment webhook: getComment failed:", err);
+    }
+  }
+}
+
+// Reconciliation cron (see wrangler.toml `[triggers]`). Every 30 minutes:
+// re-resolve metadata and re-backfill comments for each watched asset that
+// has an account_id, drop captured comments that no longer exist upstream,
+// and prune old rows from the raw event log. One asset failing (e.g. a
+// revoked token) must not stop the others.
+async function runReconciliation(env: Env): Promise<void> {
+  const watched = await listWatchedAssets(env.DB);
+  for (const w of watched) {
+    if (!w.account_id) continue;
+    try {
+      await resolveAndCacheFile(env, w.account_id, w.file_id);
+      const result = await backfillCommentsForFile(env, w.account_id, w.file_id);
+      await setBackfillStatus(env.DB, w.file_id, result.error ?? null);
+      if (!result.error && result.liveCommentIds) {
+        await deleteCommentsNotIn(env.DB, w.file_id, result.liveCommentIds);
+      }
+    } catch (err) {
+      console.error(`reconciliation: ${w.file_id} failed:`, err);
+    }
+  }
+
+  try {
+    const pruned = await pruneOldEvents(env.DB, 30);
+    console.log(`reconciliation: pruned ${pruned} frameio_events rows older than 30 days`);
+  } catch (err) {
+    console.error("reconciliation: pruneOldEvents failed:", err);
+  }
 }
 
 function stringOrNull(v: unknown): string | null {
@@ -312,6 +440,8 @@ interface CommentDetails {
   authorEmail: string | null;
   text: string | null;
   timecode: string | null;
+  commentCreatedAt: string | null;
+  commentUpdatedAt: string | null;
 }
 
 // Read a single comment record (unwrapped — i.e. what's inside `data`).
@@ -348,7 +478,20 @@ function extractCommentRecord(
         ? String(tcRaw)
         : null;
 
-  return { commentId, fileId, parentId, authorName, authorEmail, text, timecode };
+  const commentCreatedAt = getString(record, ["created_at"]);
+  const commentUpdatedAt = getString(record, ["updated_at"]);
+
+  return {
+    commentId,
+    fileId,
+    parentId,
+    authorName,
+    authorEmail,
+    text,
+    timecode,
+    commentCreatedAt,
+    commentUpdatedAt,
+  };
 }
 
 // V4 "Show comment" wraps the record in `data`. Unwrap, then delegate.
@@ -364,20 +507,25 @@ function extractCommentDetails(
 }
 
 // Backfill all existing comments for a watched file. Called from the watch
-// handler so the panel has content before the user looks at it.
+// handler (first watch + manual refresh) so the panel has content before the
+// user looks at it, and from the reconciliation cron to keep it current.
+// `liveCommentIds` — the ids actually seen in this listing — is populated
+// only on success, so callers can tell "the file currently has zero
+// comments" apart from "the fetch failed" before using it to prune stale rows.
 async function backfillCommentsForFile(
   env: Env,
   accountId: string,
   fileId: string,
-): Promise<{ inserted: number; skipped: number; error?: string }> {
+): Promise<{ inserted: number; skipped: number; error?: string; liveCommentIds?: string[] }> {
   if (!hasFrameIoCredentials(env)) {
-    return { inserted: 0, skipped: 0, error: "FRAMEIO_TOKEN not set" };
+    return { inserted: 0, skipped: 0, error: "no Frame.io credentials configured" };
   }
   try {
     const client = new FrameIoClient(env);
     const records = await client.listFileComments(accountId, fileId);
     let inserted = 0;
     let skipped = 0;
+    const liveCommentIds: string[] = [];
     for (const record of records) {
       const details = extractCommentRecord(record);
       if (!details.commentId) {
@@ -392,11 +540,14 @@ async function backfillCommentsForFile(
         author_email: details.authorEmail,
         text: details.text,
         timecode: details.timecode,
+        comment_created_at: details.commentCreatedAt,
+        comment_updated_at: details.commentUpdatedAt,
         raw_payload: JSON.stringify(record),
       });
+      liveCommentIds.push(details.commentId);
       inserted++;
     }
-    return { inserted, skipped };
+    return { inserted, skipped, liveCommentIds };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     console.error(`backfillCommentsForFile(${fileId}) failed:`, detail);
