@@ -53,7 +53,7 @@ If the existing asset is already inside a version stack (its `parent_id` is a st
 - `npm run db:migrate:remote` — applies all migrations to the remote D1.
 
 ### 2. Frame.io webhook
-Create a webhook in the Frame.io workspace settings pointing at `https://<your-worker>.workers.dev/webhook`. Subscribe to at least `file.created`, `file.updated`, `file.ready`, `comment.created`, `comment.updated`.
+Create a webhook in the Frame.io workspace settings pointing at `https://<your-worker>.workers.dev/webhook`. Subscribe to at least `file.created`, `file.updated`, `file.ready`, `file.deleted`, `comment.created`, `comment.updated`, `comment.deleted` — the deletion events drive the local tombstone/cleanup handling.
 
 See the [Frame.io V4 webhook setup guide](https://next.developer.frame.io/platform/docs/guides/webhooks) for the UI walkthrough, the full event-subscription reference, and signature-header details.
 
