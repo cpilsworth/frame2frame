@@ -63,7 +63,19 @@ wrangler secret put FRAMEIO_SIGNING_SECRET
 ```
 
 ### 3. Frame.io API token
-A bearer token from Frame.io (the developer portal or an IMS access token works). Stored as:
+
+**Recommended: Adobe IMS OAuth Server-to-Server.** Create a project in the [Adobe Developer Console](https://developer.adobe.com/console), add the Frame.io API, and choose an **OAuth Server-to-Server** credential. That gives you a client id + client secret good for long-lived, auto-refreshing access — no manual token rotation. Store them as:
+```
+wrangler secret put IMS_CLIENT_ID
+wrangler secret put IMS_CLIENT_SECRET
+```
+Optionally override the requested scopes (defaults to `openid,AdobeID,read_organizations,frameio_api,offline_access`):
+```
+wrangler secret put IMS_SCOPES
+```
+[src/frameio/ims.ts](src/frameio/ims.ts) exchanges these for a bearer token via `client_credentials`, caching it in memory and refreshing a few minutes before it expires. `FrameIoClient` uses this automatically whenever both `IMS_CLIENT_ID` and `IMS_CLIENT_SECRET` are set.
+
+**Fallback: static bearer token.** If IMS credentials aren't set, the app falls back to a plain bearer token from Frame.io (the developer portal or an IMS access token works). Stored as:
 ```
 wrangler secret put FRAMEIO_TOKEN
 ```
@@ -77,7 +89,7 @@ npm run token < token.txt      # from file
 npm run token                  # interactive — paste, then Ctrl-D
 ```
 
-Note: short-lived IMS access tokens expire in ~1 hour and need to be re-set; for production, swap in an OAuth Server-to-Server credential flow (the old `src/frameio/ims.ts` module did this and can be restored).
+Note: short-lived IMS *user* access tokens (the API Explorer fallback above) expire in ~1 hour and need to be re-set; the OAuth Server-to-Server flow above doesn't have this problem and is the recommended path for production.
 
 ### 4. UI credentials
 The browser UI (every route except `/webhook`) is protected by HTTP basic auth and fails closed (503) until a password is set:

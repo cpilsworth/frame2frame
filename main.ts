@@ -25,7 +25,7 @@ import {
   upsertAsset,
 } from "./src/db/queries";
 import { handleVersionUpload } from "./src/upload";
-import { FrameIoClient, isValidFrameIoId } from "./src/frameio/client";
+import { FrameIoClient, hasFrameIoCredentials, isValidFrameIoId } from "./src/frameio/client";
 
 export type { Env };
 
@@ -114,7 +114,7 @@ app.post("/webhook", async (c) => {
     const commentId = payload.resource?.id ?? null;
     if (!accountId || !commentId) {
       console.warn("comment webhook: missing account.id or resource.id; skipping");
-    } else if (!c.env.FRAMEIO_TOKEN) {
+    } else if (!hasFrameIoCredentials(c.env)) {
       console.warn("comment webhook: FRAMEIO_TOKEN not set; cannot resolve parent file");
     } else {
       try {
@@ -242,7 +242,7 @@ function isFileEvent(type: string): boolean {
 }
 
 async function resolveAndCacheFile(env: Env, accountId: string, fileId: string): Promise<void> {
-  if (!env.FRAMEIO_TOKEN) {
+  if (!hasFrameIoCredentials(env)) {
     console.warn(`file event for ${fileId}: FRAMEIO_TOKEN not set; cannot fetch metadata`);
     return;
   }
@@ -370,7 +370,7 @@ async function backfillCommentsForFile(
   accountId: string,
   fileId: string,
 ): Promise<{ inserted: number; skipped: number; error?: string }> {
-  if (!env.FRAMEIO_TOKEN) {
+  if (!hasFrameIoCredentials(env)) {
     return { inserted: 0, skipped: 0, error: "FRAMEIO_TOKEN not set" };
   }
   try {
