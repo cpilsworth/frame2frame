@@ -4,6 +4,7 @@
 
 import type { Env } from "../env";
 import { getImsAccessToken } from "./ims";
+import { getUserAccessToken } from "./oauth";
 
 const API_BASE = "https://api.frame.io/v4";
 
@@ -151,11 +152,27 @@ export class FrameIoClient {
 
   // ---------------------------------------------------------------------------
 
-  // IMS OAuth Server-to-Server credentials take priority when present;
-  // otherwise fall back to the static FRAMEIO_TOKEN.
+  // Credential priority: a stored user-OAuth connection (authorization-code
+  // flow) wins, then IMS Server-to-Server client credentials, then the static
+  // FRAMEIO_TOKEN. Failures at each step fall through with a log so a broken
+  // credential source degrades instead of hard-failing every request.
   private async resolveBearer(): Promise<string> {
+    try {
+      const userToken = await getUserAccessToken(this.env);
+      if (userToken) return userToken;
+    } catch (err) {
+      console.error("user OAuth token unavailable:", err);
+    }
     if (this.env.IMS_CLIENT_ID && this.env.IMS_CLIENT_SECRET) {
-      return getImsAccessToken(this.env);
+      try {
+        return await getImsAccessToken(this.env);
+      } catch (err) {
+        if (this.env.FRAMEIO_TOKEN) {
+          console.error("IMS client_credentials failed; falling back to FRAMEIO_TOKEN:", err);
+          return this.env.FRAMEIO_TOKEN;
+        }
+        throw err;
+      }
     }
     return this.env.FRAMEIO_TOKEN;
   }

@@ -11,9 +11,11 @@ export interface Env {
   // Fallback when IMS_CLIENT_ID / IMS_CLIENT_SECRET aren't set.
   FRAMEIO_TOKEN: string;
 
-  // Adobe IMS OAuth Server-to-Server credential (recommended over
-  // FRAMEIO_TOKEN — long-lived, auto-refreshing). Both must be set to use
-  // this flow; see src/frameio/ims.ts. Set via `wrangler secret put`.
+  // Adobe IMS OAuth credential — either Server-to-Server (client_credentials,
+  // src/frameio/ims.ts) or a user-auth Web App credential (authorization-code
+  // flow via /oauth/login, src/frameio/oauth.ts; its registered redirect URI
+  // must be https://<worker-host>/oauth/callback). Both fields must be set.
+  // Set via `wrangler secret put`.
   IMS_CLIENT_ID?: string;
   IMS_CLIENT_SECRET?: string;
 

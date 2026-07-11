@@ -17,6 +17,7 @@ interface HomeProps {
   webhookUrl: string;
   uploadedFileId: string | null;
   uploadStackFailed: boolean;
+  oauth: { configured: boolean; connected: boolean };
 }
 
 function prettify(raw: string) {
@@ -237,7 +238,7 @@ function WatchedPanel({
 }
 
 export function renderHome(props: HomeProps): string {
-  const { assets, watched, commentsByFile, events, webhookUrl, uploadedFileId, uploadStackFailed } =
+  const { assets, watched, commentsByFile, events, webhookUrl, uploadedFileId, uploadStackFailed, oauth } =
     props;
   const html = renderToString(
     <html lang="en">
@@ -256,6 +257,16 @@ export function renderHome(props: HomeProps): string {
               <p className="muted small">
                 Webhook URL: <code className="code">{webhookUrl}</code>
               </p>
+              {oauth.configured
+                ? (
+                  <p className="muted small">
+                    Frame.io auth:{" "}
+                    {oauth.connected
+                      ? <span>connected via Adobe sign-in ✓</span>
+                      : <a href="/oauth/login" className="link">Connect with Adobe sign-in →</a>}
+                  </p>
+                )
+                : null}
             </header>
 
             <section className="stack">

@@ -17,6 +17,7 @@
 
 import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { verifySignature } from "./verify";
 import { recordEvent, recentEvents, pruneOldEvents } from "./db";
 import { renderHome } from "./home";
@@ -38,6 +39,12 @@ import {
 } from "./src/db/queries";
 import { handleVersionUpload, handlePrepareVersion, handleFinalizeVersion } from "./src/upload";
 import { FrameIoClient, hasFrameIoCredentials, isValidFrameIoId } from "./src/frameio/client";
+import {
+  buildAuthorizeUrl,
+  exchangeAuthCode,
+  saveOAuthTokens,
+  hasOAuthConnection,
+} from "./src/frameio/oauth";
 
 export type { Env };
 
@@ -59,10 +66,11 @@ app.use("*", async (c, next) => {
 });
 
 app.get("/", async (c) => {
-  const [assets, watched, events] = await Promise.all([
+  const [assets, watched, events, oauthConnected] = await Promise.all([
     listAssetsFromEvents(c.env.DB, 50),
     listWatchedAssets(c.env.DB),
     recentEvents(c.env.DB, 20),
+    hasOAuthConnection(c.env.DB),
   ]);
   const commentsByFile: Record<string, Awaited<ReturnType<typeof commentsForFile>>> = {};
   await Promise.all(
@@ -106,8 +114,62 @@ app.get("/", async (c) => {
       webhookUrl,
       uploadedFileId,
       uploadStackFailed,
+      oauth: {
+        configured: Boolean(c.env.IMS_CLIENT_ID && c.env.IMS_CLIENT_SECRET),
+        connected: oauthConnected,
+      },
     }),
   );
+});
+
+// --- Adobe IMS user-auth OAuth connect flow (Web App credential) -------------
+// The operator clicks through /oauth/login once; the callback stores the
+// refresh token in D1 and the API client refreshes access tokens from it.
+// Both routes sit behind the basic-auth middleware like the rest of the UI.
+
+app.get("/oauth/login", (c) => {
+  if (!c.env.IMS_CLIENT_ID || !c.env.IMS_CLIENT_SECRET) {
+    return c.text("IMS_CLIENT_ID / IMS_CLIENT_SECRET not set — configure the Web App credential first", 503);
+  }
+  const state = randomHex(16);
+  setCookie(c, "oauth_state", state, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: 600,
+  });
+  const redirectUri = new URL("/oauth/callback", c.req.url).toString();
+  return c.redirect(buildAuthorizeUrl(c.env, redirectUri, state), 302);
+});
+
+app.get("/oauth/callback", async (c) => {
+  const authError = c.req.query("error");
+  if (authError) {
+    return c.text(
+      `IMS authorization failed: ${authError} ${c.req.query("error_description") ?? ""}`,
+      400,
+    );
+  }
+  const code = c.req.query("code");
+  const state = c.req.query("state");
+  const expected = getCookie(c, "oauth_state");
+  deleteCookie(c, "oauth_state", { path: "/" });
+  if (!code || !state || !expected || state !== expected) {
+    return c.text("OAuth state mismatch or missing code — restart at /oauth/login", 400);
+  }
+  const redirectUri = new URL("/oauth/callback", c.req.url).toString();
+  try {
+    const tokens = await exchangeAuthCode(c.env, code, redirectUri);
+    await saveOAuthTokens(c.env.DB, tokens);
+  } catch (err) {
+    console.error("OAuth code exchange failed:", err);
+    return c.text(
+      `OAuth code exchange failed: ${err instanceof Error ? err.message : String(err)}`,
+      502,
+    );
+  }
+  return c.redirect("/", 303);
 });
 
 app.post("/webhook", async (c) => {
@@ -401,6 +463,12 @@ async function runReconciliation(env: Env): Promise<void> {
   } catch (err) {
     console.error("reconciliation: pruneOldEvents failed:", err);
   }
+}
+
+function randomHex(bytes: number): string {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function stringOrNull(v: unknown): string | null {
