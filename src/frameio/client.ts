@@ -132,6 +132,32 @@ export class FrameIoClient {
     return wrapped.data;
   }
 
+  // Returns the folder that contains a version stack. A file's parent is
+  // either a folder or a version stack, so callers can use this to resolve a
+  // stack child back to the folder required by the local-upload endpoint.
+  async getVersionStack(accountId: string, versionStackId: string): Promise<VersionStack> {
+    const wrapped = await this.request<{ data: VersionStack }>(
+      "GET",
+      `/accounts/${safeId("account", accountId)}/version_stacks/${safeId("version stack", versionStackId)}`,
+    );
+    return wrapped.data;
+  }
+
+  // Adds an already-uploaded file to an existing version stack. The file must
+  // first be created in the stack's containing folder; Frame.io does not allow
+  // local_upload directly into a stack.
+  async moveFile(
+    accountId: string,
+    fileId: string,
+    args: { parent_id: string },
+  ): Promise<void> {
+    await this.request<unknown>(
+      "PATCH",
+      `/accounts/${safeId("account", accountId)}/files/${safeId("file", fileId)}/move`,
+      { data: { parent_id: safeId("parent", args.parent_id) } },
+    );
+  }
+
   // PUT one chunk to a Frame.io presigned S3 URL. Not authed with the bearer
   // token — the URL carries its own signature. `x-amz-acl: private` is the
   // header the docs require.

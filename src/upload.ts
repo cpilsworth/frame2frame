@@ -4,17 +4,14 @@
 //   1. POST /accounts/{a}/folders/{folder_id}/files/local_upload
 //      → response carries upload_urls[] (chunked S3 presigned PUTs).
 //   2. PUT each chunk's bytes to its signed URL with `x-amz-acl: private`.
-//   3. POST /accounts/{a}/folders/{folder_id}/version_stacks
-//      with { file_ids: [existing_file_id, new_file_id] }
-//      → stacks them as versions in the folder.
+//   3. If the file is unstacked, POST .../folders/{folder_id}/version_stacks
+//      with { file_ids: [existing_file_id, new_file_id] }. If it is already
+//      in a version stack, PATCH .../files/{new_file_id}/move with that
+//      version stack as its parent instead.
 //
 // Limitations:
 //   - Workers cap request bodies at ~100 MB. For larger files we'd need to
 //     return the presigned URLs to the browser and let it PUT directly.
-//   - If the existing watched asset is already inside a version_stack (i.e.
-//     its parent_id is a stack, not a folder), local_upload will 404. We'd
-//     have to walk up to the stack's parent folder and call a different
-//     "add to existing stack" endpoint. Not yet supported.
 
 import type { Context } from "hono";
 import type { Env } from "./env";
@@ -56,35 +53,18 @@ export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId:
   const fileSize = fileEntry.size;
 
   try {
-    // 1. Find the existing file's parent folder.
-    const fileRecord = (await client.getFile(watched.account_id, fileId)) as unknown as {
-      data?: { parent_id?: string; type?: string };
-    };
-    const parentId = fileRecord.data?.parent_id ?? null;
-    if (!parentId) {
+    // 1. Resolve the folder required by local_upload. A versioned file's
+    // parent is its stack, so upload into that stack's containing folder.
+    const location = await resolveUploadLocation(client, watched.account_id, fileId);
+    if (!location) {
       return c.json({ error: "could not resolve parent folder of existing file" }, 502);
     }
 
     // 2. Create the new file with chunked presigned upload URLs.
-    let created;
-    try {
-      created = await client.createLocalUpload(watched.account_id, parentId, {
-        name: filename,
-        file_size: fileSize,
-      });
-    } catch (err) {
-      if (err instanceof FrameIoApiError && err.status === 404) {
-        return c.json(
-          {
-            error: "upload failed",
-            detail:
-              "local_upload returned 404 — the asset's parent may be a version stack rather than a folder. Uploading additional versions onto an existing stack isn't supported yet.",
-          },
-          502,
-        );
-      }
-      throw err;
-    }
+    const created = await client.createLocalUpload(watched.account_id, location.folderId, {
+      name: filename,
+      file_size: fileSize,
+    });
 
     // 3. Slice the in-memory bytes per the chunk sizes Frame.io returned and
     //    PUT each one. The number/size of chunks varies with file_size.
@@ -114,13 +94,16 @@ export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId:
       offset = end;
     }
 
-    // 4. Stack the new file on top of the existing one as a version.
-    let versionStackId: string | null = null;
+    // 4. Create a stack for an unstacked file, or extend its existing stack.
+    let versionStackId: string;
     try {
-      const stack = await client.createVersionStack(watched.account_id, parentId, {
-        file_ids: [fileId, created.id],
-      });
-      versionStackId = stack.id;
+      versionStackId = await addFileAsVersion(
+        client,
+        watched.account_id,
+        fileId,
+        created.id,
+        location,
+      );
     } catch (err) {
       // The new file is uploaded; if stacking fails the user still has both
       // files in the folder. Surface the partial success rather than aborting.
@@ -132,7 +115,7 @@ export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId:
     }
 
     return c.redirect(
-      `/?uploaded=${encodeURIComponent(fileId)}&new_file=${encodeURIComponent(created.id)}&stack=${encodeURIComponent(versionStackId ?? "")}`,
+      `/?uploaded=${encodeURIComponent(fileId)}&new_file=${encodeURIComponent(created.id)}&stack=${encodeURIComponent(versionStackId)}`,
       303,
     );
   } catch (err) {
@@ -144,8 +127,8 @@ export async function handleVersionUpload(c: Context<{ Bindings: Env }>, fileId:
 
 // Direct-upload, step 1: create the placeholder file and hand its presigned
 // chunk URLs back to the browser, which PUTs to them itself (no ~100 MB body
-// cap). Mirrors handleVersionUpload's checks and its 404 → version-stack
-// explanation, but stops before the bytes are transferred.
+// cap). Supports both files directly inside folders and files already inside
+// version stacks, but stops before bytes are transferred.
 export async function handlePrepareVersion(c: Context<{ Bindings: Env }>, fileId: string) {
   const watched = await getWatchedAsset(c.env.DB, fileId);
   if (!watched) {
@@ -172,32 +155,14 @@ export async function handlePrepareVersion(c: Context<{ Bindings: Env }>, fileId
 
   const client = new FrameIoClient(c.env);
   try {
-    const fileRecord = (await client.getFile(watched.account_id, fileId)) as unknown as {
-      data?: { parent_id?: string };
-    };
-    const parentId = fileRecord.data?.parent_id ?? null;
-    if (!parentId) {
+    const location = await resolveUploadLocation(client, watched.account_id, fileId);
+    if (!location) {
       return c.json({ error: "could not resolve parent folder of existing file" }, 502);
     }
-    let created;
-    try {
-      created = await client.createLocalUpload(watched.account_id, parentId, {
-        name,
-        file_size: size,
-      });
-    } catch (err) {
-      if (err instanceof FrameIoApiError && err.status === 404) {
-        return c.json(
-          {
-            error: "upload failed",
-            detail:
-              "local_upload returned 404 — the asset's parent may be a version stack rather than a folder. Uploading additional versions onto an existing stack isn't supported yet.",
-          },
-          502,
-        );
-      }
-      throw err;
-    }
+    const created = await client.createLocalUpload(watched.account_id, location.folderId, {
+      name,
+      file_size: size,
+    });
     return c.json({ new_file_id: created.id, upload_urls: created.upload_urls });
   } catch (err) {
     console.error("Prepare upload failed:", err);
@@ -233,22 +198,65 @@ export async function handleFinalizeVersion(c: Context<{ Bindings: Env }>, fileI
 
   const client = new FrameIoClient(c.env);
   try {
-    const fileRecord = (await client.getFile(watched.account_id, fileId)) as unknown as {
-      data?: { parent_id?: string };
-    };
-    const parentId = fileRecord.data?.parent_id ?? null;
-    if (!parentId) {
+    const location = await resolveUploadLocation(client, watched.account_id, fileId);
+    if (!location) {
       return c.json({ error: "could not resolve parent folder of existing file" }, 502);
     }
-    const stack = await client.createVersionStack(watched.account_id, parentId, {
-      file_ids: [fileId, newFileId],
-    });
-    return c.json({ version_stack_id: stack.id });
+    const versionStackId = await addFileAsVersion(client, watched.account_id, fileId, newFileId, location);
+    return c.json({ version_stack_id: versionStackId });
   } catch (err) {
     console.error("Finalize upload failed:", err);
     const status = err instanceof FrameIoApiError ? err.status : 500;
     return c.json({ error: "finalize failed", detail: errorDetail(err) }, status === 401 ? 502 : 500);
   }
+}
+
+interface UploadLocation {
+  folderId: string;
+  versionStackId: string | null;
+}
+
+// A Frame.io file is contained by exactly one folder or version stack. Probe
+// the parent as a version stack: a 404 means it is the folder itself; a
+// successful response gives the containing folder needed for local_upload.
+async function resolveUploadLocation(
+  client: FrameIoClient,
+  accountId: string,
+  fileId: string,
+): Promise<UploadLocation | null> {
+  const fileRecord = (await client.getFile(accountId, fileId)) as unknown as {
+    data?: { parent_id?: string };
+  };
+  const parentId = fileRecord.data?.parent_id ?? null;
+  if (!parentId) return null;
+
+  try {
+    const stack = await client.getVersionStack(accountId, parentId);
+    if (!stack.parent_id) return null;
+    return { folderId: stack.parent_id, versionStackId: parentId };
+  } catch (err) {
+    if (err instanceof FrameIoApiError && err.status === 404) {
+      return { folderId: parentId, versionStackId: null };
+    }
+    throw err;
+  }
+}
+
+async function addFileAsVersion(
+  client: FrameIoClient,
+  accountId: string,
+  existingFileId: string,
+  newFileId: string,
+  location: UploadLocation,
+): Promise<string> {
+  if (location.versionStackId) {
+    await client.moveFile(accountId, newFileId, { parent_id: location.versionStackId });
+    return location.versionStackId;
+  }
+  const stack = await client.createVersionStack(accountId, location.folderId, {
+    file_ids: [existingFileId, newFileId],
+  });
+  return stack.id;
 }
 
 function errorDetail(err: unknown): string {

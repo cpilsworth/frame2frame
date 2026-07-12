@@ -272,19 +272,26 @@ sequenceDiagram
     B->>W: POST /assets/:fileId/versions (multipart, field=file)
     W->>D: SELECT watched_assets WHERE file_id = ?
     W->>API: GET file → read data.parent_id
-    W->>API: POST .../folders/{parent_id}/files/local_upload {name, file_size}
+    alt file is already in a version stack
+      W->>API: GET version_stack → read its parent_id (folder)
+    end
+    W->>API: POST .../folders/{folder_id}/files/local_upload {name, file_size}
     API-->>W: { data: { id, upload_urls: [{url, size}, ...] } }
     loop For each chunk
       W->>S3: PUT chunk bytes (x-amz-acl: private)
     end
-    W->>API: POST .../folders/{parent_id}/version_stacks {file_ids:[old, new]}
-    API-->>W: { data: { id } }
+    alt unstacked file
+      W->>API: POST .../folders/{folder_id}/version_stacks {file_ids:[old, new]}
+      API-->>W: { data: { id } }
+    else existing version stack
+      W->>API: PATCH .../files/{new}/move {parent_id: stack_id}
+    end
     W-->>B: 303 redirect /?uploaded=...&stack=...
 ```
 
 **Failure modes handled:**
-- `local_upload` 404 → asset's parent is already a version stack; surface a clear error.
-- `version_stacks` 5xx → new file is uploaded; redirect with `&stack_failed=1` flag so the operator knows to stack manually.
+- `local_upload` failure → upload has not begun; surface the Frame.io error.
+- Version-stack creation or move failure → new file is uploaded; redirect with `&stack_failed=1` flag so the operator knows to stack manually.
 
 ## 7. Operational considerations
 
@@ -326,8 +333,8 @@ Cloudflare Workers cap request bodies at ~100 MB (paid plan). The upload handler
 | `FRAMEIO_TOKEN` not set | Webhook still accepted + logged; API callbacks skipped with a warning |
 | Frame.io API 401 | Logged; surface up to the caller (UI or webhook ack) |
 | Frame.io API 404 on file resolution | Logged; webhook still acked |
-| Upload `local_upload` 404 | UI surfaces "parent may be a version stack" message |
-| Upload `version_stacks` failure | New file persists; UI redirected with `stack_failed=1` |
+| Upload `local_upload` failure | UI surfaces the Frame.io error before any bytes are sent |
+| Upload version-stack update failure | New file persists; UI redirected with `stack_failed=1` |
 
 ## 8. Setup
 
@@ -349,7 +356,7 @@ home.tsx                      Server-rendered UI
 src/env.ts                    Env bindings + secrets
 src/db/queries.ts             watched_assets / captured_comments / assets queries
 src/frameio/client.ts         V4 API client (getFile, getComment, listFileComments,
-                              createLocalUpload, createVersionStack, putUploadChunk)
+                              createLocalUpload, createVersionStack, getVersionStack, moveFile, putUploadChunk)
 src/upload.ts                 Multipart upload orchestration
 migrations/0001..0005         D1 schema migrations
 scripts/sign-test.ts          HMAC test helper
@@ -360,7 +367,6 @@ scripts/update-token.sh       Token refresh utility
 
 - **Token lifecycle**: short-lived bearer + manual refresh. Restoring the OAuth Server-to-Server flow from the deleted `src/frameio/ims.ts` would give the worker hands-off token rotation, at the cost of needing Developer Console credentials.
 - **Direct-to-S3 upload**: move the bytes off the worker path by returning the presigned URLs to the browser. Removes the 100 MB cap.
-- **Version stacks → add to existing stack**: if the asset's `parent_id` is already a stack, the current upload flow surfaces an error. Wiring the `version-stacks/copy` or equivalent "add to existing stack" endpoint would close that case.
 - **Operator auth**: gate `/watch/:fileId` and `/assets/:fileId/versions` behind a token-based check or Cloudflare Access.
 - **Pagination on the assets table**: currently capped at 50 rows from `listAssetsFromEvents`. Either add a cursor parameter or paginate in the UI.
 - **Comment thread structure**: V4 exposes replies via `?include=replies`; the PoC stores `parent_id` as null. Adding replies would let the UI render threads.

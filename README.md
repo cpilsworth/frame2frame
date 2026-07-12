@@ -39,12 +39,10 @@ Frame.io V4 webhooks are intentionally thin — they carry only IDs (`account`, 
 
 ### New-version upload flow
 Cloudflare Worker proxies bytes for now (capped ~100 MB by Workers' request body limit).
-1. `GET file` → find the existing asset's `parent_id` (the folder it lives in).
+1. `GET file` → find the existing asset's `parent_id`. If that is a version stack, resolve the stack's containing folder.
 2. `POST /accounts/{a}/folders/{folder_id}/files/local_upload` → response carries chunked S3 presigned PUT URLs.
 3. PUT each chunk to its signed URL with `x-amz-acl: private`.
-4. `POST /accounts/{a}/folders/{folder_id}/version_stacks` with `file_ids: [existing, new]` → stacks them as versions in the same folder.
-
-If the existing asset is already inside a version stack (its `parent_id` is a stack rather than a folder), local_upload returns 404 and the UI surfaces a clear error — adding to an existing stack isn't yet wired up.
+4. For an unstacked asset, `POST /accounts/{a}/folders/{folder_id}/version_stacks` with `file_ids: [existing, new]`; for an existing stack, `PATCH /accounts/{a}/files/{new}/move` with the stack ID as `parent_id`.
 
 ## Setup
 
